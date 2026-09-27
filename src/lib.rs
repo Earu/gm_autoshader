@@ -74,15 +74,7 @@ fn compile_shader(game_path: &str, shader_path: &PathBuf) -> Result<String, Stri
         return Err(format!("Shader path does not have a valid file name: {:?}", shader_path));
     }
 
-    let unix_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-    if let Err(e) = unix_now {
-        return Err(format!("Failed to get current time: {e}"));
-    }
-
-    let newer_shader_name = format!("{}_{}", shader_name.unwrap().to_string_lossy(), unix_now.unwrap().as_secs());
-    let mut target_vcs_path = game_root.join(format!("garrysmod/shaders/shaders/fxc/{}.vcs", newer_shader_name));
-    target_vcs_path.set_extension("vcs");
-
+    let target_vcs_path = game_root.join(format!("garrysmod/shaders/shaders/fxc/{}.vcs", shader_name.unwrap().to_string_lossy()));
     let output = Command::new(compiler)
         .current_dir(&game_root)
         .args([
@@ -104,7 +96,13 @@ fn compile_shader(game_path: &str, shader_path: &PathBuf) -> Result<String, Stri
 
     if let Ok(_) = compile_result {
         if fs::exists(&target_vcs_path).unwrap_or(false) {
-            match fs::copy(&target_vcs_path, &shader_source_dir.join("fxc").join(target_vcs_path.file_name().unwrap())) {
+            let unix_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+            if let Err(e) = unix_now {
+                return Err(format!("Failed to get current time: {e}"));
+            }
+
+            let newer_shader_name = format!("{}_{}.vcs", shader_name.unwrap().to_string_lossy(), unix_now.unwrap().as_secs());
+            match fs::copy(&target_vcs_path, &shader_source_dir.join(format!("fxc/{}", newer_shader_name))) {
                 Err(e) => {
                     compile_result = Err(format!("Failed to copy compiled shader to shaders/fxc: {e}"));
                 }
