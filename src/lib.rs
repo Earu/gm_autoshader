@@ -4,6 +4,7 @@ use std::time::Instant;
 use std::{fs, path::PathBuf};
 use std::process::Command;
 use crossbeam::queue::SegQueue;
+use notify::event::ModifyKind;
 use notify::{RecursiveMode, Watcher, recommended_watcher};
 use reqwest::blocking::get;
 
@@ -207,7 +208,7 @@ fn gmod13_open(lua: gmod::lua::State) -> i32 {
             if let Ok(ev) = res {
                 match ev.kind {
                     notify::EventKind::Create(_) |
-                    notify::EventKind::Modify(_) => {
+                    notify::EventKind::Modify(ModifyKind::Data(_)) => {
                         // Reload shaders
                         if let Some(shader_path) = ev.paths.last() {
                             if shader_path.extension().map(|ext| ext == "hlsl").unwrap_or(false) {
