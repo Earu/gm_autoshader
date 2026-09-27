@@ -1,7 +1,11 @@
-use std::path::PathBuf;
+use std::error;
+use std::io::Write;
+use std::time::Instant;
+use std::{fs, path::PathBuf};
 use std::process::Command;
 use crossbeam::queue::SegQueue;
 use notify::{RecursiveMode, Watcher, recommended_watcher};
+use reqwest::blocking::get;
 
 #[macro_use]
 extern crate gmod;
@@ -33,11 +37,51 @@ fn get_game_path() -> Result<String, String> {
     Err(format!("Garry's Mod root directory not found"))
 }
 
+fn download(url: &str, path: &PathBuf) -> Result<(), Box<dyn error::Error>> {
+    let now = Instant::now();
+    let response = get(url)?;
+    let content = response.bytes()?;
+
+    let mut downloaded_file = fs::File::create(path)?;
+    downloaded_file.write_all(&content)?;
+
+    let duration = now.elapsed();
+    println!("Downloaded file in {duration:?}");
+    Ok(())
+}
+
+const COMPILER_URL: &str = "https://raw.githubusercontent.com/Earu/gm_autoshader/refs/heads/main/ShaderCompile.exe";
+const COMPILER_NAME: &str = "ShaderCompile_standalone.exe";
 fn compile_shader(game_path: &str, shader_path: &PathBuf) -> Result<String, String> {
     let game_root = PathBuf::from(game_path);
-    let compiler = game_root.join("bin/ShaderCompile.exe");
+    let compiler = game_root.join(format!("bin/{}", COMPILER_NAME));
+
+    match fs::exists(&compiler) {
+        Ok(exists) => {
+            if !exists {
+                if let Err(e) = download(COMPILER_URL, &compiler) {
+                    return Err(format!("Failed to download shader compiler: {e}"));
+                }
+            }
+        }
+        Err(e) => return Err(format!("Could not check whether shader compiler exists (missing permissions?): {e}"))
+    }
+
     let shader_source_dir = game_root.join("garrysmod/shaders");
-    let is30 = shader_path.to_str().unwrap().ends_with("30.hlsl"); // check what shader version is being compiled
+    let is30 = shader_path.to_str().map_or(false, |s| s.ends_with("30.hlsl"));
+    let shader_name = shader_path.file_stem();
+    if let None = shader_name {
+        return Err(format!("Shader path does not have a valid file name: {:?}", shader_path));
+    }
+
+    let unix_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    if let Err(e) = unix_now {
+        return Err(format!("Failed to get current time: {e}"));
+    }
+
+    let newer_shader_name = format!("{}_{}", shader_name.unwrap().to_string_lossy(), unix_now.unwrap().as_secs());
+    let mut target_vcs_path = game_root.join(format!("garrysmod/shaders/shaders/fxc/{}.vcs", newer_shader_name));
+    target_vcs_path.set_extension("vcs");
 
     let output = Command::new(compiler)
         .current_dir(&game_root)
@@ -52,10 +96,29 @@ fn compile_shader(game_path: &str, shader_path: &PathBuf) -> Result<String, Stri
         .arg(shader_path)
         .output();
 
-    match output {
+
+    let mut compile_result = match output {
         Ok(output) => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
         Err(error) => Err(format!("Failed to execute shader compiler: {error}"))
+    };
+
+    if let Ok(_) = compile_result {
+        if fs::exists(&target_vcs_path).unwrap_or(false) {
+            match fs::copy(&target_vcs_path, &shader_source_dir.join("fxc").join(target_vcs_path.file_name().unwrap())) {
+                Err(e) => {
+                    compile_result = Err(format!("Failed to copy compiled shader to shaders/fxc: {e}"));
+                }
+                _ => match fs::remove_file(&target_vcs_path) {
+                    Err(e) => {
+                        compile_result = Err(format!("Failed to remove temporary compiled shader: {e}"));
+                    }
+                    _ => {},
+                }
+            };
+        }
     }
+
+    return compile_result;
 }
 
 static mut WATCHER: Option<notify::RecommendedWatcher> = None;
@@ -68,7 +131,7 @@ fn handle_compile_result(lua: gmod::lua::State) -> i32 {
             if let Some(result) = queue.pop() {
                 match result {
                     Ok(output) => {
-                        lua.get_global(lua_string!("MsgN"));
+                        lua.get_global(lua_string!("Msg"));
                         if lua.is_function(-1) {
                             lua.push_string(&output);
                             lua.call(1, 0);
@@ -151,7 +214,9 @@ fn gmod13_open(lua: gmod::lua::State) -> i32 {
                         if let Some(shader_path) = ev.paths.last() {
                             if shader_path.extension().map(|ext| ext == "hlsl").unwrap_or(false) {
                                 let compile_result = compile_shader(&game_path_clone, shader_path);
-                                COMPILE_RESULTS.as_ref().unwrap().push(compile_result);
+                                if let Some(queue) = &COMPILE_RESULTS {
+                                    queue.push(compile_result);
+                                }
                             }
                         }
                     }
