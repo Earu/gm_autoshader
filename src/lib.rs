@@ -21,15 +21,12 @@ fn get_game_path() -> Result<String, String> {
     // - GarrysMod/
     // We need to find the GarrysMod root directory which contains the "garrysmod" folder
 
-    // Try up to 5 parent directories
     for _ in 0..5 {
-        // Check if this directory contains "garrysmod" subdirectory
         let garrysmod_path = current.join("garrysmod");
         if garrysmod_path.exists() && garrysmod_path.is_dir() {
             return Ok(current.to_string_lossy().to_string());
         }
 
-        // Go up one directory
         if !current.pop() {
             break;
         }
@@ -138,7 +135,7 @@ fn handle_compile_result(lua: gmod::lua::State) -> i32 {
                             lua.pop();
                         }
 
-                        return 1; // Return the output string
+                        return 0;
                     }
                     Err(err) => {
                         lua.error(&format!("Shader compilation error: {err}"));
@@ -209,7 +206,6 @@ fn gmod13_open(lua: gmod::lua::State) -> i32 {
                 match ev.kind {
                     notify::EventKind::Create(_) |
                     notify::EventKind::Modify(ModifyKind::Data(_)) => {
-                        // Reload shaders
                         if let Some(shader_path) = ev.paths.last() {
                             if shader_path.extension().map(|ext| ext == "hlsl").unwrap_or(false) {
                                 let compile_result = compile_shader(&game_path_clone, shader_path);
@@ -255,7 +251,7 @@ fn gmod13_close(lua: gmod::lua::State) -> i32 {
 
         remove_queue_handler(lua);
         if let Some(queue) = COMPILE_RESULTS.take() {
-            while queue.pop().is_some() {} // Clear the queue
+            while queue.pop().is_some() {}
             drop(queue);
         }
 
