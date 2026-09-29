@@ -6,9 +6,9 @@ require("autoshader.core")
 function Shader(name)
 	local most_recent = 0
 	local shader_name
-	for _, f in pairs(file.Find("shaders/fxc/" .. name .. "*.vcs", "MOD")) do
-		if f:match(name .. "_%d+%.vcs") then
-			local timestamp = tonumber(f:match(name .. "_(%d+)%.vcs"))
+	for _, f in pairs(file.Find("shaders/fxc/*.vcs", "MOD")) do
+		if f:match("^" .. name:PatternSafe() .. "_%d+%.vcs") then
+			local timestamp = tonumber(f:match("^" .. name:PatternSafe() .. "_(%d+)%.vcs"))
 			if timestamp and timestamp > most_recent then
 				most_recent = timestamp
 				shader_name = f
