@@ -1,0 +1,87 @@
+name: Build GMod Binaries
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            name: win64
+          - target: i686-pc-windows-msvc
+            name: win32
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup toolchain install nightly --profile minimal --target ${{ matrix.target }}
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/gm_autoshader.dll" "artifacts/gmcl_autoshader.core_${{ matrix.name }}.dll"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gm_autoshader_${{ matrix.name }}
+          path: artifacts/*
+          retention-days: 30
+
+  release:
+    name: Upload Release Assets
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Build install zip
+        run: |
+          mkdir -p bundle/lua/bin bundle/lua/includes/modules
+          cp release/*.dll bundle/lua/bin/
+          cp lua/includes/modules/autoshader.lua bundle/lua/includes/modules/
+          (cd bundle && zip -r ../gm_autoshader.zip lua)
+
+      - name: Upload release assets
+        run: gh release upload "${{ github.event.release.tag_name }}" release/*.dll gm_autoshader.zip --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
