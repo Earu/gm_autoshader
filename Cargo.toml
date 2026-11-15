@@ -13,3 +13,4 @@ gmod = { git = "https://github.com/WilliamVenner/gmod-rs", default-features = fa
 notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
 crossbeam = "0.8"
 reqwest = { version = "0.13.5", features = ["blocking"] }
+gm_shadercompat = { git = "https://github.com/Earu/gm_shadercompat" }

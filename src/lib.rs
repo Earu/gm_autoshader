@@ -1,16 +1,18 @@
 use std::error;
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
+use std::path::Path;
 use std::time::Instant;
 use std::{fs, path::PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::{Mutex, Once};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use crossbeam::queue::SegQueue;
+use gm_shadercompat::{Checker, Compiler, Diagnostic, Status, Style};
 use notify::event::ModifyKind;
 use notify::{RecursiveMode, Watcher, recommended_watcher};
 use reqwest::blocking::get;
@@ -59,6 +61,7 @@ const COMPILER_URL: &str = "https://raw.githubusercontent.com/Earu/gm_autoshader
 const COMPILER_NAME: &str = "ShaderCompile_standalone.exe";
 const COMPILER_DIR: &str = "bin/autoshader";
 const HLSL_COMPILER_DLL: &str = "d3dcompiler_47.dll";
+const TOGL_CONVAR: &str = "autoshader_togl";
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -74,6 +77,7 @@ fn windowless_command(program: impl AsRef<OsStr>) -> Command {
 
 static RUNNING_COMPILER: Mutex<Option<Child>> = Mutex::new(None);
 static CLOSING: AtomicBool = AtomicBool::new(false);
+static TOGL_CHECK: AtomicBool = AtomicBool::new(true);
 
 fn run_compiler(mut child: Child) -> io::Result<(ExitStatus, Vec<u8>)> {
 	let mut stdout = child.stdout.take();
@@ -94,6 +98,10 @@ fn run_compiler(mut child: Child) -> io::Result<(ExitStatus, Vec<u8>)> {
 		Some(mut child) => Ok((child.wait()?, log)),
 		None => Err(io::Error::new(io::ErrorKind::Other, "the shader compiler handle was lost")),
 	}
+}
+
+fn spawn_compiler(command: &mut Command) -> io::Result<(ExitStatus, Vec<u8>)> {
+	command.spawn().and_then(run_compiler)
 }
 
 fn stop_running_compiler() {
@@ -127,20 +135,15 @@ fn force_native_hlsl_compiler_under_wine() {
 	});
 }
 
-fn readable_output(raw: &[u8]) -> String {
-	let text = String::from_utf8_lossy(raw);
-	let mut lines: Vec<&str> = text
-		.split(|c| c == '\r' || c == '\n')
-		.map(|line| line.trim_end())
-		.filter(|line| !line.is_empty())
-		.collect();
-
-	lines.push("");
-	lines.join("\n")
+enum Output {
+	Compiled(String),
+	Warning(String),
+	Error(String),
+	Notice(String),
+	Failed(String),
 }
 
-fn compile_shader(game_path: &str, shader_path: &PathBuf) -> Result<String, String> {
-	let game_root = PathBuf::from(game_path);
+fn prepare_compiler(game_root: &Path) -> Result<PathBuf, String> {
 	let compiler_dir = game_root.join(COMPILER_DIR);
 	if let Err(e) = fs::create_dir_all(&compiler_dir) {
 		return Err(format!("Failed to create the shader compiler directory: {e}"));
@@ -158,78 +161,93 @@ fn compile_shader(game_path: &str, shader_path: &PathBuf) -> Result<String, Stri
 	}
 
 	match fs::exists(&compiler) {
-		Ok(exists) => {
-			if !exists {
-				let copied = legacy_compiler.exists() && fs::copy(&legacy_compiler, &compiler).is_ok();
-				if !copied {
-					if let Err(e) = download(COMPILER_URL, &compiler) {
-						return Err(format!("Failed to download shader compiler: {e}"));
-					}
+		Ok(true) => {}
+		Ok(false) => {
+			let copied = legacy_compiler.exists() && fs::copy(&legacy_compiler, &compiler).is_ok();
+			if !copied {
+				if let Err(e) = download(COMPILER_URL, &compiler) {
+					return Err(format!("Failed to download shader compiler: {e}"));
 				}
 			}
 		}
-		Err(e) => return Err(format!("Could not check whether shader compiler exists (missing permissions?): {e}"))
+		Err(e) => return Err(format!("Could not check whether shader compiler exists (missing permissions?): {e}")),
 	}
 
 	force_native_hlsl_compiler_under_wine();
+	Ok(compiler)
+}
 
-	let shader_source_dir = game_root.join("garrysmod/shaders");
-	let is30 = shader_path.to_str().map_or(false, |s| s.ends_with("30.hlsl"));
-	let shader_name = shader_path.file_stem();
-	if let None = shader_name {
-		return Err(format!("Shader path does not have a valid file name: {:?}", shader_path));
+fn rendered(diagnostics: &[Diagnostic], label: &str, root: &Path) -> String {
+	let style = Style { color: false };
+	diagnostics.iter().map(|d| d.render_as(style, label, Some(root)) + "\n").collect()
+}
+
+fn togl_warnings(shader_path: &Path, name: &str, compiler: &Compiler, release: &[u8], root: &Path) -> Vec<Output> {
+	let mut checker = Checker::new();
+	if !matches!(checker.check_vcs(shader_path, release, None), Status::Fail(_)) {
+		return Vec::new();
 	}
 
-	let target_vcs_path = game_root.join(format!("garrysmod/shaders/shaders/fxc/{}.vcs", shader_name.unwrap().to_string_lossy()));
-	let output = windowless_command(compiler)
-		.current_dir(&game_root)
-		.args([
-			"/O",
-			"3",
-			"-ver",
-			if is30 { "30" } else { "20b" },
-			"-shaderpath",
-		])
-		.arg(&shader_source_dir)
-		.arg(shader_path)
-		.stdin(Stdio::null())
-		.stdout(Stdio::piped())
-		.stderr(Stdio::null())
-		.spawn()
-		.and_then(run_compiler);
-
-
-	let mut compile_result = match output {
-		Ok((status, log)) => {
-			let log = readable_output(&log);
-			if status.success() { Ok(log) } else { Err(log) }
+	if !CLOSING.load(Ordering::SeqCst) {
+		if let Ok(debug) = gm_shadercompat::compile(shader_path, compiler, true, spawn_compiler) {
+			let mut detailed = Checker::new();
+			if matches!(detailed.check_vcs(shader_path, &debug.vcs, None), Status::Fail(_)) {
+				checker = detailed;
+			}
 		}
-		Err(error) => Err(format!("Failed to execute shader compiler: {error}"))
+	}
+
+	vec![
+		Output::Warning(rendered(checker.diagnostics(), "warning", root)),
+		Output::Notice(format!("autoshader: {name} will crash native Linux and macOS clients (ToGL), {TOGL_CONVAR} 0 hides these warnings\n")),
+	]
+}
+
+fn compile_shader(game_path: &str, shader_path: &PathBuf) -> Vec<Output> {
+	let game_root = PathBuf::from(game_path);
+	let root = game_root.join("garrysmod");
+	let shader_source_dir = root.join("shaders");
+
+	let Some(name) = shader_path.file_stem().map(|s| s.to_string_lossy().to_string()) else {
+		return vec![Output::Failed(format!("Shader path does not have a valid file name: {:?}", shader_path))];
 	};
 
-	if let Ok(_) = compile_result {
-		if fs::exists(&target_vcs_path).unwrap_or(false) {
-			let unix_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-			if let Err(e) = unix_now {
-				return Err(format!("Failed to get current time: {e}"));
-			}
+	let compiler = match prepare_compiler(&game_root) {
+		Ok(exe) => Compiler { exe, wine: None },
+		Err(e) => return vec![Output::Failed(e)],
+	};
 
-			let newer_shader_name = format!("{}_{}.vcs", shader_name.unwrap().to_string_lossy(), unix_now.unwrap().as_secs());
-			match fs::copy(&target_vcs_path, &shader_source_dir.join(format!("fxc/{}", newer_shader_name))) {
-				Err(e) => {
-					compile_result = Err(format!("Failed to copy compiled shader to shaders/fxc: {e}"));
-				}
-				_ => match fs::remove_file(&target_vcs_path) {
-					Err(e) => {
-						compile_result = Err(format!("Failed to remove temporary compiled shader: {e}"));
-					}
-					_ => {},
-				}
-			};
+	let started = Instant::now();
+	let compiled = match gm_shadercompat::compile(shader_path, &compiler, false, spawn_compiler) {
+		Ok(compiled) => compiled,
+		Err(failure) => {
+			let mut checker = Checker::new();
+			checker.add_compile_failure(shader_path, failure);
+			let count = checker.diagnostics().len();
+			let errors = if count == 1 { "1 error".to_string() } else { format!("{count} errors") };
+			return vec![
+				Output::Failed(format!("autoshader: {name} failed to compile ({errors})\n")),
+				Output::Error(rendered(checker.diagnostics(), "error", &root)),
+			];
 		}
+	};
+	let elapsed = started.elapsed().as_secs_f32();
+
+	let unix_now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+		Ok(now) => now.as_secs(),
+		Err(e) => return vec![Output::Failed(format!("Failed to get current time: {e}"))],
+	};
+
+	let stamped_name = format!("{name}_{unix_now}.vcs");
+	if let Err(e) = fs::write(shader_source_dir.join("fxc").join(&stamped_name), &compiled.vcs) {
+		return vec![Output::Failed(format!("autoshader: failed to write the compiled shader to shaders/fxc: {e}\n"))];
 	}
 
-	return compile_result;
+	let mut output = vec![Output::Compiled(format!("autoshader: {name} compiled in {elapsed:.1}s -> shaders/fxc/{stamped_name}\n"))];
+	if TOGL_CHECK.load(Ordering::SeqCst) {
+		output.extend(togl_warnings(shader_path, &name, &compiler, &compiled.vcs, &root));
+	}
+	output
 }
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
@@ -259,42 +277,150 @@ fn compile_changes(game_path: String, changes: Receiver<PathBuf>) {
 }
 
 static mut WATCHER: Option<notify::RecommendedWatcher> = None;
-static mut COMPILE_RESULTS: Option<SegQueue<Result<String, String>>> = None;
+static mut COMPILE_RESULTS: Option<SegQueue<Vec<Output>>> = None;
+
+unsafe fn call_global(lua: gmod::lua::State, name: gmod::lua::LuaString, text: &str) {
+	lua.get_global(name);
+	if lua.is_function(-1) {
+		lua.push_string(text);
+		lua.call(1, 0);
+	} else {
+		lua.pop();
+	}
+}
+
+unsafe fn print_colored(lua: gmod::lua::State, rgb: (f64, f64, f64), text: &str) {
+	lua.get_global(lua_string!("MsgC"));
+	if !lua.is_function(-1) {
+		lua.pop();
+		call_global(lua, lua_string!("Msg"), text);
+		return;
+	}
+
+	lua.get_global(lua_string!("Color"));
+	if !lua.is_function(-1) {
+		lua.pop_n(2);
+		call_global(lua, lua_string!("Msg"), text);
+		return;
+	}
+
+	lua.push_number(rgb.0);
+	lua.push_number(rgb.1);
+	lua.push_number(rgb.2);
+	lua.call(3, 1);
+	lua.push_string(text);
+	lua.call(2, 0);
+}
+
+const WARNING_COLOR: (f64, f64, f64) = (255.0, 190.0, 60.0);
+const ERROR_COLOR: (f64, f64, f64) = (255.0, 100.0, 100.0);
+const BODY_COLOR: (f64, f64, f64) = (210.0, 210.0, 210.0);
+const OK_COLOR: (f64, f64, f64) = (120.0, 220.0, 120.0);
+
+unsafe fn print_diagnostics(lua: gmod::lua::State, header: (f64, f64, f64), text: &str) {
+	for block in text.split_inclusive("\n\n") {
+		let (first, rest) = block.split_at(block.find('\n').map_or(block.len(), |i| i + 1));
+		print_colored(lua, header, first);
+		if !rest.is_empty() {
+			print_colored(lua, BODY_COLOR, rest);
+		}
+	}
+}
 
 #[lua_function]
 fn handle_compile_result(lua: gmod::lua::State) -> i32 {
 	unsafe {
-		if let Some(queue) = &COMPILE_RESULTS {
-			if let Some(result) = queue.pop() {
-				match result {
-					Ok(output) => {
-						lua.get_global(lua_string!("Msg"));
-						if lua.is_function(-1) {
-							lua.push_string(&output);
-							lua.call(1, 0);
-						} else {
-							lua.pop();
-						}
+		let Some(queue) = &COMPILE_RESULTS else { return 0 };
+		let Some(outputs) = queue.pop() else { return 0 };
 
-						return 0;
-					}
-					Err(err) => {
-						lua.get_global(lua_string!("ErrorNoHalt"));
-						if lua.is_function(-1) {
-							lua.push_string(&format!("Shader compilation error:\n{}\n", err.trim_end()));
-							lua.call(1, 0);
-						} else {
-							lua.pop();
-						}
-
-						return 0;
-					}
-				}
+		for output in outputs {
+			match output {
+				Output::Compiled(text) => print_colored(lua, OK_COLOR, &text),
+				Output::Warning(text) => print_diagnostics(lua, WARNING_COLOR, &text),
+				Output::Error(text) => print_diagnostics(lua, ERROR_COLOR, &text),
+				Output::Notice(text) => print_colored(lua, WARNING_COLOR, &text),
+				Output::Failed(text) => call_global(lua, lua_string!("ErrorNoHalt"), &text),
 			}
 		}
 	}
 
 	0
+}
+
+#[lua_function]
+fn togl_convar_changed(lua: gmod::lua::State) -> i32 {
+	unsafe {
+		let enabled = lua.get_string(3).and_then(|v| v.trim().parse::<f64>().ok()).map_or(false, |v| v != 0.0);
+		TOGL_CHECK.store(enabled, Ordering::SeqCst);
+	}
+
+	0
+}
+
+fn create_togl_convar(lua: gmod::lua::State) {
+	unsafe {
+		lua.get_global(lua_string!("CreateClientConVar"));
+		if !lua.is_function(-1) {
+			lua.pop();
+			return;
+		}
+
+		lua.push_string(TOGL_CONVAR);
+		lua.push_string("1");
+		lua.push_boolean(true);
+		lua.push_boolean(false);
+		lua.push_string("Warn when a compiled shader would crash native Linux and macOS clients (ToGL)");
+		lua.call(5, 1);
+		if !lua.is_nil(-1) {
+			lua.get_field(-1, lua_string!("GetBool"));
+			if lua.is_function(-1) {
+				lua.push_value(-2);
+				lua.call(1, 1);
+				TOGL_CHECK.store(lua.get_boolean(-1), Ordering::SeqCst);
+			}
+			lua.pop();
+		}
+		lua.pop();
+
+		lua.get_global(lua_string!("cvars"));
+		if !lua.is_table(-1) {
+			lua.pop();
+			return;
+		}
+
+		lua.get_field(-1, lua_string!("AddChangeCallback"));
+		if !lua.is_function(-1) {
+			lua.pop_n(2);
+			return;
+		}
+
+		lua.push_string(TOGL_CONVAR);
+		lua.push_function(togl_convar_changed);
+		lua.push_string("autoshader");
+		lua.call(3, 0);
+		lua.pop();
+	}
+}
+
+fn remove_togl_callback(lua: gmod::lua::State) {
+	unsafe {
+		lua.get_global(lua_string!("cvars"));
+		if !lua.is_table(-1) {
+			lua.pop();
+			return;
+		}
+
+		lua.get_field(-1, lua_string!("RemoveChangeCallback"));
+		if !lua.is_function(-1) {
+			lua.pop_n(2);
+			return;
+		}
+
+		lua.push_string(TOGL_CONVAR);
+		lua.push_string("autoshader");
+		lua.call(2, 0);
+		lua.pop();
+	}
 }
 
 fn create_queue_handler(lua: gmod::lua::State) {
@@ -350,6 +476,7 @@ fn gmod13_open(lua: gmod::lua::State) -> i32 {
 
 		COMPILE_RESULTS = Some(SegQueue::new());
 		CLOSING.store(false, Ordering::SeqCst);
+		create_togl_convar(lua);
 		let (changes, pending_changes) = channel::<PathBuf>();
 		let game_path_clone = game_path.clone();
 		std::thread::spawn(move || compile_changes(game_path_clone, pending_changes));
@@ -403,6 +530,7 @@ fn gmod13_close(lua: gmod::lua::State) -> i32 {
 
 		stop_running_compiler();
 		remove_queue_handler(lua);
+		remove_togl_callback(lua);
 		if let Some(queue) = COMPILE_RESULTS.take() {
 			while queue.pop().is_some() {}
 			drop(queue);
